@@ -3,7 +3,8 @@
 <head>
     <meta charset="utf-8" />
     <link rel="stylesheet" href="//aui-cdn.atlassian.com/aui-adg/5.9.12/css/aui.min.css" media="all">
-    <link rel="stylesheet" href="/css/github-app.css" media="all">
+    <link rel="stylesheet" href="/github-app.css" media="all">
+  <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/3.3.6/css/bootstrap.min.css">
     <script>
       var oauthWindow;
       function doAuthorization() {
@@ -28,9 +29,15 @@
       <div class="ac-content">
         <div class="github-dev-panel">
         <p class="title">
-            Please link JIRA with your GitHub account: <a href="javascript:doAuthorization()" id="github-authorization">Connect to GitHub</a>
+            Please link JIRA with your GitHub account:
+          <li class="list-group-item">
+            <%= @icon_svg %>
+          <a href="javascript:doAuthorization()" id="github-authorization">Connect to GitHub</a>
+          </li>
         </p>
-        <p><a href="/logout">clear settings</a></p>
+        <p>
+          <span class="btn"><a href="/logout">clear settings</a></span>
+        </p>
         </div>
       </div>
    </body>

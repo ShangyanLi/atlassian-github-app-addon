@@ -1,3 +1,4 @@
+require 'atlassian/jwt'
 require 'jwt'
 require 'rest_client'
 require 'json'
@@ -8,6 +9,8 @@ require 'sinatra/cookies'
 require 'uri'
 require 'yaml'
 require 'securerandom'
+require 'httparty'
+require 'octicons_helper/helper'
 
 $stdout.sync = true
 $default_branch_name = "JIRA-BOT-BRANCH"
@@ -30,6 +33,8 @@ rescue
     GITHUB_APP_ID = ENV.fetch("GITHUB_APP_ID")
     GITHUB_APP_URL = ENV.fetch("GITHUB_APP_URL")
     COOKIE_SECRET = ENV.fetch("COOKIE_SECRET")
+    ATLASSIAN_CLIENT_KEY = ENV.fetch("ATLASSIAN_CLIENT_KEY", "")
+    ATLASSIAN_SHARED_SECRET = ENV.fetch("ATLASSIAN_SHARED_SECRET", "")
   rescue KeyError
     $stderr.puts "To run this script, please set the following environment variables:"
     $stderr.puts "- GITHUB_CLIENT_ID: GitHub Developer Application Client ID"
@@ -69,6 +74,29 @@ Octokit.default_media_type = "application/vnd.github.machine-man-preview+json"
 # -----------------
 client = Octokit::Client.new
 
+post '/addon_installed' do
+  begin
+    request.body.rewind
+    request_payload = JSON.parse request.body.read
+    ATLASSIAN_CLIENT_KEY = request_payload["clientKey"]
+    ATLASSIAN_SHARED_SECRET = request_payload["sharedSecret"]
+    puts ATLASSIAN_SHARED_SECRET  # TODO: secure management of shared secrets for security contexts
+
+    status 200
+    body ''
+  rescue
+    status 404
+    body ''
+  end
+end
+
+
+post '/addon_uninstalled' do
+  status 200
+  body ''
+end
+
+
 get '/callback' do
   session_code = params[:code]
   result = Octokit.exchange_code_for_token(session_code, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET)
@@ -94,7 +122,10 @@ get '/main_entry' do
   session[:fqdn] = params[:xdm_e].nil? ? "" : params[:xdm_e]
   # JIRA ID is passed as context-parameters.
   # Referenced in atlassian-connect.json
+  session[:addon_key] = params.fetch("xdm_deprecated_addon_key_do_not_use")
   session[:jira_issue] = params.fetch("issueKey", $default_branch_name)
+  puts ATLASSIAN_SHARED_SECRET
+  session[:summary] = get_issue_info(session[:jira_issue], session[:fqdn], session[:addon_key], ATLASSIAN_SHARED_SECRET)
   redirect to('/')
 end
 
@@ -107,23 +138,25 @@ get '/' do
   # Need user's OAuth token to lookup installation id
   if !authenticated?
     @url = client.authorize_url(GITHUB_CLIENT_ID)
+    @icon_svg = Octicons::Octicon.new("mark-github").to_svg
     return erb :login
   end
 
   if !set_repo?
     @name_list = get_user_repositories(session[:access_token])
     if @name_list.length == 0
-      puts @name_list
       @app_url = GITHUB_APP_URL
       return erb :install_app
     end
     session[:name_list] = @name_list
     # Show end-user a list of all repositories they can create a branch in
-    return erb :show_repos
+    redirect to('/select_repo')
   else
-
-    if branch_exists?(session[:jira_issue])
-
+    unless set_branch?
+      session[:branch_name] = issue_to_branch_name(session[:jira_issue])
+    end
+    if branch_exists?(session[:branch_name])  # TODO: need exact match instead of prefix
+      @icon_svg = Octicons::Octicon.new("git-branch").to_svg
       return erb :link_to_branch
     end
 
@@ -133,6 +166,8 @@ get '/' do
     end
 
     @repo_name = session[:repo_name]
+    @default_branch_suffix = sanitize_branch_name(session[:summary])
+    @icon_svg = Octicons::Octicon.new("git-branch").to_svg
     return erb :create_branch
   end
 end
@@ -152,6 +187,7 @@ end
 # Clear all session information
 get '/logout' do
   session.delete(:repo_name)
+  session.delete(:branch_name)
   session.delete(:name_list)
   session.delete(:app_token)
   session.delete(:access_token)
@@ -160,14 +196,20 @@ end
 
 # Create a branch for the selected repository if it doesn't already exist.
 get '/create_branch' do
-  if !set_repo? || branch_exists?(session[:jira_issue])
+  if !set_repo? || !set_branch? || branch_exists?(session[:branch_name])
     redirect to('/')
   end
   app_token = get_app_token(session[:repo_name][:installation_id])
   client = Octokit::Client.new(:access_token => app_token )
 
   repo_name = session[:repo_name][:full_name]
-  branch_name = session[:jira_issue]
+  branch_name = session[:branch_name]
+  unless params[:suffix].nil?
+    suffix = params[:suffix]
+    branch_name = "#{branch_name}-#{suffix}"
+  end
+  session[:branch_name] = branch_name
+
   begin
     # Look up default branch
     repo_data = client.repository(repo_name)
@@ -184,6 +226,16 @@ get '/create_branch' do
   redirect to('/')
 end
 
+# List all repos
+get '/select_repo' do
+  if !authenticated? || !session.key?(:name_list)
+    redirect to('/')
+  end
+  @name_list = session[:name_list]
+  @icon_svg = Octicons::Octicon.new("repo").to_svg
+  return erb :show_repos
+end
+
 # Store which Repository the user selected
 get '/add_repo' do
   if !authenticated?
@@ -196,6 +248,7 @@ get '/add_repo' do
   session[:name_list].each do |repository_name|
     if input_repo == repository_name[:full_name]
       session[:repo_name] = repository_name
+      session[:branch_name] = issue_to_branch_name(session[:jira_issue])
       break
     end
   end
@@ -211,19 +264,45 @@ def authenticated?
   !session[:access_token].nil? && session[:access_token] != ''
 end
 
+# Returns whether a branch name has been set for this JIRA issue
+def set_branch?
+  !session[:branch_name].nil? && session[:branch_name] != ''
+end
+
 # Returns whether the user selected a repository to map to this JIRA project
 def set_repo?
   !session[:repo_name].nil? && session[:repo_name] != ''
 end
 
-# Returns whether a branch for this issue already exists
-def branch_exists?(jira_issue)
-
+# Returns branch name with JIRA issue prefix if one exists, otherwise JIRA issue key
+def issue_to_branch_name(jira_issue)
   app_token = get_app_token(session[:repo_name][:installation_id])
   client = Octokit::Client.new(:access_token => app_token)
 
   repo_name = session[:repo_name][:full_name]
   branch_name = jira_issue
+
+  begin
+    # Does this branch exist
+    ref_resp = client.ref(repo_name, "heads/#{branch_name}")
+  rescue => e
+    puts e
+    return branch_name
+  end
+
+  branch_name = ref_resp[0].ref.split("refs/heads/")[-1]
+  branch_name
+end
+
+
+# Returns whether a branch for this issue already exists
+def branch_exists?(branch_name_query)
+
+  app_token = get_app_token(session[:repo_name][:installation_id])
+  client = Octokit::Client.new(:access_token => app_token)
+
+  repo_name = session[:repo_name][:full_name]
+  branch_name = branch_name_query
 
   begin
     # Does this branch exist
@@ -267,8 +346,15 @@ def get_user_installations(access_token)
     authorization: "token #{access_token}",
     accept: "application/vnd.github.machine-man-preview+json"
   }
+  # headers = {
+  #   accept: "application/vnd.github.machine-man-preview+json"
+  # }
 
-  response = RestClient.get(url,headers)
+  begin
+    response = RestClient.get(url,headers)
+  rescue => e
+    puts e.response.body
+  end
   json_response = JSON.parse(response)
 
   installation_id = []
@@ -325,4 +411,20 @@ def get_app_token(installation_id)
     puts "app_access_token #{error}"
   end
   return_val
+end
+
+def sanitize_branch_name(branch_name)
+  branch_name.gsub! "..", ""
+  branch_name.gsub! ".lock", ""
+  branch_name.gsub! /[\/~^: \[\]\\]/, "-"  # replaces /,~,^,:,[,],\, and whitespaces with -
+  branch_name
+end
+
+def get_issue_info(issue_key, base_url, issuer, shared_secret)
+  url = "#{base_url}/rest/api/latest/search?fields=summary&jql=issueKey=#{issue_key}"
+  http_method = 'GET'
+  claim = Atlassian::Jwt.build_claims(issuer,url,http_method)
+  jwt = JWT.encode(claim,shared_secret)
+  response = HTTParty.get("#{url}&jwt=#{jwt}")
+  response.parsed_response["issues"][0]["fields"]["summary"]
 end
